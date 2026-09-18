@@ -73,6 +73,24 @@ class EventAccepted(BaseModel):
     duplicates: list[TaskRef]
 
 
+class EventCancelResult(BaseModel):
+    """Result of POST /events/{event_id}/cancel: per-status task counts.
+
+    'cancelled' counts the tasks this call moved to the terminal
+    'cancelled' state; 'already_cancelled' those cancelled by earlier
+    calls (a repeated cancel is idempotent and reports 0 / N here). The
+    remaining counts are tasks left untouched because they were already
+    being delivered or had reached a terminal state.
+    """
+
+    event_id: str
+    cancelled: int
+    already_cancelled: int
+    in_progress: int
+    delivered: int
+    failed: int
+
+
 class AttemptOut(BaseModel):
     attempt_no: int
     status_code: int | None

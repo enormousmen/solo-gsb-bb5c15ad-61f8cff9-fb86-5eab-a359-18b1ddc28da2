@@ -16,6 +16,7 @@ from . import config, signing
 from .db import Database
 from .schemas import (
     EventAccepted,
+    EventCancelResult,
     EventCreate,
     EventStatus,
     IngestEvent,
@@ -201,6 +202,29 @@ def submit_event(body: EventCreate, response: Response) -> dict:
 
     response.status_code = 201 if created else 200
     return {"event_id": body.event_id, "created": created, "duplicates": duplicates}
+
+
+@app.post("/events/{event_id}/cancel", response_model=EventCancelResult)
+def cancel_event(event_id: str) -> dict:
+    """Cancel all still-unclaimed delivery tasks of an event (idempotent).
+
+    Only 'pending' tasks move to the terminal 'cancelled' state, in a
+    single atomic transaction; tasks already being delivered or finished
+    keep their outcome. Cancelled tasks are never retried, never counted
+    by the circuit breaker, and no longer block later tasks of the same
+    subscription. Repeating the call is a no-op that reports the current
+    per-status counts.
+    """
+    result = app.state.db.cancel_event(event_id)
+    if result is None:
+        raise HTTPException(404, f"event {event_id!r} not found")
+    log.info(
+        "event %s: %s task(s) cancelled (%s already cancelled, %s in progress, "
+        "%s delivered, %s failed)",
+        event_id, result["cancelled"], result["already_cancelled"],
+        result["in_progress"], result["delivered"], result["failed"],
+    )
+    return result
 
 
 # ----------------------------------------------------------------------

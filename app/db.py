@@ -39,14 +39,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     event_id         TEXT NOT NULL REFERENCES events(id),
     subscription_id  TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'pending'
-                     CHECK (status IN ('pending', 'in_progress', 'delivered', 'failed')),
+                     CHECK (status IN ('pending', 'in_progress', 'delivered', 'failed', 'cancelled')),
     attempts         INTEGER NOT NULL DEFAULT 0,
     max_attempts     INTEGER NOT NULL,
     next_attempt_at  REAL,              -- epoch seconds; NULL once finished
     claimed_by       TEXT,
     last_status_code INTEGER,
     last_error       TEXT,
-    result           TEXT CHECK (result IN ('delivered', 'failed')),
+    result           TEXT CHECK (result IN ('delivered', 'failed', 'cancelled')),
     created_at       REAL NOT NULL,
     updated_at       REAL NOT NULL,
     UNIQUE (event_id, subscription_id)  -- one task per (event, subscription)
@@ -98,6 +98,7 @@ class Database:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._migrate_tasks_cancelled()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -132,6 +133,72 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN breaker_probe_task_id INTEGER"
             )
+
+    def _migrate_tasks_cancelled(self) -> None:
+        """Rebuild the tasks table when its CHECK constraints predate 'cancelled'.
+
+        SQLite cannot alter CHECK constraints, so databases created before
+        the 'cancelled' status existed need the tasks table rebuilt: copy
+        rows into a new table, drop the old one, rename, and recreate the
+        indexes. The rebuild runs in a single transaction with foreign key
+        enforcement temporarily disabled (the standard SQLite table-rebuild
+        procedure); task ids are preserved, so attempt history and breaker
+        probe references stay valid. Fresh databases already get the new
+        CHECK constraints from SCHEMA and are skipped.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+        ).fetchone()
+        if row is None or "cancelled" in row["sql"]:
+            return
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute(
+                """CREATE TABLE tasks_new (
+                       id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                       event_id         TEXT NOT NULL REFERENCES events(id),
+                       subscription_id  TEXT NOT NULL,
+                       status           TEXT NOT NULL DEFAULT 'pending'
+                                        CHECK (status IN ('pending', 'in_progress',
+                                                          'delivered', 'failed', 'cancelled')),
+                       attempts         INTEGER NOT NULL DEFAULT 0,
+                       max_attempts     INTEGER NOT NULL,
+                       next_attempt_at  REAL,
+                       claimed_by       TEXT,
+                       last_status_code INTEGER,
+                       last_error       TEXT,
+                       result           TEXT CHECK (result IN ('delivered', 'failed', 'cancelled')),
+                       created_at       REAL NOT NULL,
+                       updated_at       REAL NOT NULL,
+                       UNIQUE (event_id, subscription_id)
+                   )"""
+            )
+            self._conn.execute(
+                """INSERT INTO tasks_new
+                       (id, event_id, subscription_id, status, attempts, max_attempts,
+                        next_attempt_at, claimed_by, last_status_code, last_error,
+                        result, created_at, updated_at)
+                   SELECT id, event_id, subscription_id, status, attempts, max_attempts,
+                          next_attempt_at, claimed_by, last_status_code, last_error,
+                          result, created_at, updated_at
+                   FROM tasks"""
+            )
+            self._conn.execute("DROP TABLE tasks")
+            self._conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks (status, next_attempt_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_sub_order "
+                "ON tasks (subscription_id, id, status)"
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys=ON")
 
     def close(self) -> None:
         with self._lock:
@@ -305,6 +372,76 @@ class Database:
             ).fetchone()
             self._conn.commit()
         return dict(row), created
+
+    def cancel_event(self, event_id: str) -> dict | None:
+        """Cancel every still-unclaimed ('pending') task of an event, atomically.
+
+        Only 'pending' tasks move to the terminal 'cancelled' state; tasks
+        already 'in_progress' or in a terminal state keep their outcome.
+        The whole update runs in one transaction under the connection lock,
+        so a concurrent claim either wins first (the task is 'in_progress'
+        and skipped) or loses (the task is 'cancelled' and unclaimable).
+
+        Cancelled tasks are never claimed again, so they take no part in
+        retries; they never reach finish_attempt, so the circuit breaker's
+        failure counting never sees them; and being neither 'pending' nor
+        'in_progress', they no longer block later tasks of the same
+        subscription.
+
+        If a cancelled task was its subscription's half-open breaker probe,
+        the probe can never run: the breaker is handed back to 'open' with
+        a fresh cooldown so a new probe is elected afterwards. A
+        cancellation is not a delivery failure, so the consecutive-failure
+        count is left untouched.
+
+        Returns None when the event does not exist; otherwise per-status
+        task counts: 'cancelled' (moved by this call), 'already_cancelled',
+        and the untouched 'in_progress' / 'delivered' / 'failed' tallies.
+        Repeating the call is idempotent: it cancels nothing and reports
+        the first call's tasks under 'already_cancelled'.
+        """
+        now = time.time()
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if exists is None:
+                return None
+            cur = self._conn.execute(
+                """UPDATE tasks
+                   SET status = 'cancelled', result = 'cancelled',
+                       next_attempt_at = NULL, claimed_by = NULL, updated_at = ?
+                   WHERE event_id = ? AND status = 'pending'""",
+                (now, event_id),
+            )
+            cancelled = cur.rowcount
+            # A cancelled half-open probe can never run; return the breaker
+            # to 'open' with a fresh cooldown (failure count untouched).
+            self._conn.execute(
+                """UPDATE subscriptions
+                   SET breaker_state = 'open', breaker_next_probe_at = ?,
+                       breaker_probe_task_id = NULL
+                   WHERE breaker_state = 'half_open'
+                     AND breaker_probe_task_id IN (
+                           SELECT id FROM tasks
+                           WHERE event_id = ? AND status = 'cancelled'
+                         )""",
+                (now + self._breaker_cooldown, event_id),
+            )
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks WHERE event_id = ? GROUP BY status",
+                (event_id,),
+            ).fetchall()
+            self._conn.commit()
+        counts = {r["status"]: r["n"] for r in rows}
+        return {
+            "event_id": event_id,
+            "cancelled": cancelled,
+            "already_cancelled": counts.get("cancelled", 0) - cancelled,
+            "in_progress": counts.get("in_progress", 0),
+            "delivered": counts.get("delivered", 0),
+            "failed": counts.get("failed", 0),
+        }
 
     def ingest_event(
         self,
