@@ -7,10 +7,17 @@ is exhausted.
 
 Claiming is strictly ordered per subscription: a task becomes claimable
 only after every earlier task (smaller id) of the same subscription has
-reached a terminal state (delivered/failed). The rule is enforced inside
-the atomic claim query, so it holds across retries, concurrent workers,
-and restarts, while different subscriptions are still delivered in
-parallel by multiple workers.
+reached a terminal state (delivered/failed/cancelled). The rule is
+enforced inside the atomic claim query, so it holds across retries,
+concurrent workers, and restarts, while different subscriptions are
+still delivered in parallel by multiple workers.
+
+Event cancellation (POST /events/{id}/cancel) moves still-pending tasks
+to the terminal 'cancelled' state. Such tasks are never claimed, never
+retried, and never recorded through finish_attempt, so they neither touch
+the circuit-breaker counters nor block subsequent tasks of the same
+subscription. A task already in progress when the cancel arrives runs to
+completion and keeps its real result.
 
 A per-subscription circuit breaker (persisted in the DB) stops claiming
 once too many consecutive tasks have failed permanently: while 'open' no

@@ -86,17 +86,46 @@ class TaskStatus(BaseModel):
     task_id: int
     subscription_id: str
     target_url: str | None
-    status: str
+    status: str  # 'pending' | 'in_progress' | 'delivered' | 'failed' | 'cancelled'
     attempts: int
     max_attempts: int
     next_attempt_at: str | None
     last_status_code: int | None
     last_error: str | None
     result: str | None
+    cancelled_at: str | None  # set only when the task was cancelled with its event
     history: list[AttemptOut]
+
+
+class EventStatusCounts(BaseModel):
+    """Per-status task totals for an event (all counts always present)."""
+
+    pending: int
+    in_progress: int
+    delivered: int
+    failed: int
+    cancelled: int
 
 
 class EventStatus(BaseModel):
     event_id: str
     created_at: str
+    cancelled: bool  # the event was cancelled at least once (one or more tasks are 'cancelled')
+    cancelled_at: str | None  # when the event's last cancel ran (ISO time, null if never)
+    counts: EventStatusCounts
     targets: list[TaskStatus]
+
+
+class EventCancelResult(BaseModel):
+    """Result of POST /events/{event_id}/cancel.
+
+    'cancelled' is the number of tasks moved to 'cancelled' by this call
+    (0 on a repeated, idempotent call); 'counts' reports the resulting
+    per-status totals, so callers can see how many tasks were already in
+    flight or finished at cancel time.
+    """
+
+    event_id: str
+    cancelled: int
+    cancelled_at: str
+    counts: EventStatusCounts

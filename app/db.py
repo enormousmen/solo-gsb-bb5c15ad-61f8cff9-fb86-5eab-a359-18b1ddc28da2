@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     event_id         TEXT NOT NULL REFERENCES events(id),
     subscription_id  TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'pending'
-                     CHECK (status IN ('pending', 'in_progress', 'delivered', 'failed')),
+                     CHECK (status IN
+                       ('pending', 'in_progress', 'delivered', 'failed', 'cancelled')),
     attempts         INTEGER NOT NULL DEFAULT 0,
     max_attempts     INTEGER NOT NULL,
     next_attempt_at  REAL,              -- epoch seconds; NULL once finished
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     result           TEXT CHECK (result IN ('delivered', 'failed')),
     created_at       REAL NOT NULL,
     updated_at       REAL NOT NULL,
+    cancelled_at     REAL,              -- epoch seconds when an event cancel claimed the task
     UNIQUE (event_id, subscription_id)  -- one task per (event, subscription)
 );
 
@@ -104,7 +106,11 @@ class Database:
         """Bring databases created by older versions up to date.
 
         CREATE TABLE IF NOT EXISTS leaves pre-existing tables untouched, so
-        columns added later are applied here via ALTER TABLE.
+        columns added later are applied here via ALTER TABLE. The tasks
+        table additionally needs a widened status CHECK to accept the
+        'cancelled' terminal state; SQLite cannot ALTER a CHECK constraint,
+        so an old tasks table is rebuilt (foreign_keys off, inside a single
+        transaction, per the SQLite recommended table-rebuild procedure).
         """
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
         if "paused_at" not in cols:
@@ -132,6 +138,68 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN breaker_probe_task_id INTEGER"
             )
+
+        task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+        if "cancelled_at" not in task_cols:
+            # Commit the subscription ALTERs first; the rebuild then runs as
+            # its own explicit transaction. executescript() is avoided on
+            # purpose: it silently COMMITs any open transaction first.
+            self._conn.commit()
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self._conn.execute("BEGIN")
+                self._conn.execute(
+                    """
+                    CREATE TABLE tasks_new (
+                        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id         TEXT NOT NULL REFERENCES events(id),
+                        subscription_id  TEXT NOT NULL,
+                        status           TEXT NOT NULL DEFAULT 'pending'
+                                         CHECK (status IN
+                                           ('pending', 'in_progress', 'delivered',
+                                            'failed', 'cancelled')),
+                        attempts         INTEGER NOT NULL DEFAULT 0,
+                        max_attempts     INTEGER NOT NULL,
+                        next_attempt_at  REAL,
+                        claimed_by       TEXT,
+                        last_status_code INTEGER,
+                        last_error       TEXT,
+                        result           TEXT CHECK (result IN ('delivered', 'failed')),
+                        created_at       REAL NOT NULL,
+                        updated_at       REAL NOT NULL,
+                        cancelled_at     REAL,
+                        UNIQUE (event_id, subscription_id)
+                    )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO tasks_new
+                        (id, event_id, subscription_id, status, attempts, max_attempts,
+                         next_attempt_at, claimed_by, last_status_code, last_error,
+                         result, created_at, updated_at, cancelled_at)
+                    SELECT id, event_id, subscription_id, status, attempts, max_attempts,
+                           next_attempt_at, claimed_by, last_status_code, last_error,
+                           result, created_at, updated_at, NULL
+                    FROM tasks
+                    """
+                )
+                self._conn.execute("DROP TABLE tasks")
+                self._conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
+                self._conn.execute(
+                    "CREATE INDEX idx_tasks_due ON tasks (status, next_attempt_at)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX idx_tasks_sub_order ON tasks (subscription_id, id, status)"
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            finally:
+                # Re-enable foreign keys while outside the transaction; the
+                # constructor's ON setting is what every new connection gets.
+                self._conn.execute("PRAGMA foreign_keys=ON")
 
     def close(self) -> None:
         with self._lock:
@@ -394,12 +462,17 @@ class Database:
         Strict per-subscription ordering: a task is eligible only when no
         earlier task (smaller id) of the same subscription is still
         'pending' or 'in_progress' -- the next task is released once its
-        predecessor reaches a terminal state ('delivered'/'failed'). The
-        rule is evaluated against persisted state at claim time, so it
-        holds across retry backoff, concurrent workers, and restarts.
-        Different subscriptions are independent and still claimed in
-        parallel; a blocked task simply stays 'pending' and remains
-        visible as such in status queries.
+        predecessor reaches a terminal state
+        ('delivered'/'failed'/'cancelled'). The rule is evaluated against
+        persisted state at claim time, so it holds across retry backoff,
+        concurrent workers, and restarts. Different subscriptions are
+        independent and still claimed in parallel; a blocked task simply
+        stays 'pending' and remains visible as such in status queries.
+
+        Event-cancelled tasks ('cancelled') are terminal and never selected:
+        they neither retry nor count towards a subscription's breaker, and
+        because they leave the pending/in_progress set they never block a
+        later task of the same subscription.
 
         Paused subscriptions (paused_at set) are skipped entirely: their
         tasks stay 'pending' with their original next_attempt_at and
@@ -566,7 +639,12 @@ class Database:
             )
 
     def requeue_in_progress(self) -> int:
-        """Reset tasks left 'in_progress' by a previous run (crash/restart recovery)."""
+        """Reset tasks left 'in_progress' by a previous run (crash/restart recovery).
+
+        Such a task is again unclaimed ('pending'), so if its event is
+        (re-)cancelled after this reset the task is eligible for cancellation
+        like any other pending task; otherwise it is redelivered.
+        """
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
@@ -605,4 +683,87 @@ class Database:
             "event": dict(event),
             "tasks": [dict(t) for t in tasks],
             "attempts_by_task": history,
+        }
+
+    def cancel_event(self, event_id: str) -> dict | None:
+        """Atomically cancel every not-yet-claimed delivery task of an event.
+
+        Runs under the connection lock in a single transaction, serialized
+        against worker claims, so a task a worker has already claimed
+        ('in_progress') -- or which has already finished
+        ('delivered'/'failed') -- is never touched and keeps its recorded
+        result; only rows still 'pending' are flipped to the terminal
+        'cancelled' state. Cancelled tasks:
+
+        - are never claimed again (the claim query only selects 'pending'),
+          so they take part in no retry and never reach finish_attempt,
+          which also means they never move the circuit-breaker counters;
+        - are terminal for the per-subscription ordering rule (the claim
+          query's blocking NOT EXISTS watches only 'pending'/'in_progress'),
+          so later tasks of the same subscription are released immediately.
+
+        One edge case is repaired in the same transaction: a half-open
+        breaker records exactly one probe task. That task sits 'pending'
+        while backing off between probe attempts and can therefore be
+        cancelled; the breaker is then moved back to 'open' with the probe
+        due at once so the next pending task becomes the replacement probe
+        instead of the subscription being wedged in 'half_open' forever.
+
+        Repeated cancellation is idempotent: the second call finds no
+        'pending' rows, cancels zero, and reports the same totals. Returns
+        None when the event does not exist.
+        """
+        now = time.time()
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if exists is None:
+                return None
+
+            cur = self._conn.execute(
+                """UPDATE tasks
+                       SET status = 'cancelled', next_attempt_at = NULL,
+                           claimed_by = NULL, cancelled_at = ?, updated_at = ?
+                     WHERE event_id = ? AND status = 'pending'""",
+                (now, now, event_id),
+            )
+            newly_cancelled = cur.rowcount
+
+            if newly_cancelled:
+                # Release any half-open breaker whose unique probe was just
+                # cancelled; the next claim promotes the earliest remaining
+                # pending task to a fresh, immediately-due probe.
+                self._conn.execute(
+                    """UPDATE subscriptions
+                          SET breaker_state = 'open', breaker_next_probe_at = ?,
+                              breaker_probe_task_id = NULL
+                        WHERE breaker_state = 'half_open'
+                          AND breaker_probe_task_id IN (
+                              SELECT id FROM tasks
+                               WHERE event_id = ? AND status = 'cancelled'
+                          )""",
+                    (now, event_id),
+                )
+
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks WHERE event_id = ? GROUP BY status",
+                (event_id,),
+            ).fetchall()
+            counts = {
+                "pending": 0,
+                "in_progress": 0,
+                "delivered": 0,
+                "failed": 0,
+                "cancelled": 0,
+            }
+            for r in rows:
+                counts[r["status"]] = r["n"]
+            self._conn.commit()
+
+        return {
+            "event_id": event_id,
+            "cancelled": newly_cancelled,
+            "cancelled_at": now,
+            "counts": counts,
         }

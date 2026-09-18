@@ -16,6 +16,7 @@ from . import config, signing
 from .db import Database
 from .schemas import (
     EventAccepted,
+    EventCancelResult,
     EventCreate,
     EventStatus,
     IngestEvent,
@@ -268,14 +269,48 @@ async def ingest_event(request: Request, response: Response) -> dict:
     return result
 
 
+@app.post("/events/{event_id}/cancel", response_model=EventCancelResult)
+def cancel_event(event_id: str) -> dict:
+    """Cancel the still-pending delivery tasks of an event (idempotent).
+
+    Only tasks no worker has claimed yet are cancelled; tasks already in
+    progress run to completion and finished tasks keep their recorded
+    result. Cancelled tasks are terminal: they are never retried, never
+    counted by the per-subscription circuit breaker, and never block later
+    tasks of the same subscription. Repeating the call is a no-op that
+    returns the same per-status totals; an unknown event returns 404.
+    """
+    result = app.state.db.cancel_event(event_id)
+    if result is None:
+        raise HTTPException(404, f"event {event_id!r} not found")
+    log.info(
+        "event %s cancelled: %s task(s) newly cancelled, totals=%s",
+        event_id,
+        result["cancelled"],
+        result["counts"],
+    )
+    return {
+        "event_id": event_id,
+        "cancelled": result["cancelled"],
+        "cancelled_at": _iso(result["cancelled_at"]),
+        "counts": result["counts"],
+    }
+
+
 @app.get("/events/{event_id}", response_model=EventStatus)
 def get_event_status(event_id: str) -> dict:
     data = app.state.db.event_status(event_id)
     if data is None:
         raise HTTPException(404, f"event {event_id!r} not found")
 
+    counts = {"pending": 0, "in_progress": 0, "delivered": 0, "failed": 0, "cancelled": 0}
+    last_cancelled_at: float | None = None
     targets = []
     for t in data["tasks"]:
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+        if t["status"] == "cancelled" and t.get("cancelled_at") is not None:
+            if last_cancelled_at is None or t["cancelled_at"] > last_cancelled_at:
+                last_cancelled_at = t["cancelled_at"]
         history = [
             {
                 "attempt_no": a["attempt_no"],
@@ -299,11 +334,15 @@ def get_event_status(event_id: str) -> dict:
                 "last_status_code": t["last_status_code"],
                 "last_error": t["last_error"],
                 "result": t["result"],
+                "cancelled_at": _iso(t.get("cancelled_at")),
                 "history": history,
             }
         )
     return {
         "event_id": event_id,
         "created_at": _iso(data["event"]["created_at"]),
+        "cancelled": counts["cancelled"] > 0,
+        "cancelled_at": _iso(last_cancelled_at),
+        "counts": counts,
         "targets": targets,
     }
